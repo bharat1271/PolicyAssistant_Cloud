@@ -4,7 +4,7 @@ A RAG (Retrieval-Augmented Generation) chat assistant that answers natural-langu
 
 This is the cloud-hosted version, deployed on Streamlit Community Cloud with Groq for generation. There's also a fully local version of this same project that runs offline with Ollama, no API key or internet needed. See `../PolicyAssistant_Portfolio`.
 
-**Live demo:** add your `*.streamlit.app` link here once deployed.
+**Live demo:** Link `[*.streamlit.app](https://policyassistantcloud.streamlit.app/)`.
 
 ## Why I built this
 

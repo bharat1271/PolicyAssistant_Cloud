@@ -1,0 +1,16 @@
+# Policy Assistant — Hybrid RAG over a structured policy document (CLOUD version)
+# Python >= 3.10
+#
+# Local test run:
+#   pip install -r requirements.txt
+#   export GROQ_API_KEY=your_key_here      # or set it in .streamlit/secrets.toml
+#   python generate_synthetic_policy.py    # creates the sample policy document
+#   streamlit run app.py
+#
+# Streamlit Community Cloud deployment: see README.md.
+
+streamlit==1.41.1
+python-docx==1.1.2
+groq>=0.11.0
+sentence-transformers>=3.0.0
+numpy>=1.26.0

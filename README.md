@@ -1,236 +1,155 @@
-# Policy Assistant — Cloud Version (Streamlit Community Cloud + Groq)
+# Policy Assistant
 
-Same product as [`PolicyAssistant_Portfolio`](../PolicyAssistant_Portfolio) —
-a hybrid-RAG chat assistant grounded in a structured policy document — rebuilt
-to run as a public, hosted Streamlit app instead of on a local machine with
-Ollama. Same synthetic policy document, same retrieval logic, same UI. Three
-backend swaps, described below.
+A RAG (Retrieval-Augmented Generation) chat assistant that answers natural-language questions about a structured policy document, with every answer grounded in the actual retrieved text and citing which section it came from.
 
-If you haven't read the local version's README yet, read that one first — it
-explains *why* the retrieval design (structure-aware parsing, hybrid
-semantic+keyword search, RRF fusion, section diversity capping) looks the way
-it does. This README only covers what's different here and why.
+This is the cloud-hosted version, deployed on Streamlit Community Cloud with Groq for generation. There's also a fully local version of this same project that runs offline with Ollama, no API key or internet needed. See `../PolicyAssistant_Portfolio`.
 
----
+**Live demo:** add your `*.streamlit.app` link here once deployed.
 
-## Why a separate folder instead of one codebase with a mode switch
+## Why I built this
 
-An earlier iteration of this project tried to keep local and cloud in one
-codebase behind a config flag, with the embedding/LLM/vector-store calls
-factored into their own shared modules (`embeddings.py`, `llm.py`,
-`vectorstore.py`). That added a layer of indirection — you had to open two or
-three files to see what actually happens for one backend — before there was
-any real payoff from sharing code, since the local and cloud paths only share
-about a dozen lines of logic (chunking, RRF, section-diversity) in the first
-place. Two small, fully-readable, single-purpose folders turned out to be
-easier to explain and easier to maintain than one clever one.
+Most "chat with your document" demos just dump a file into a generic text splitter and call it a day. That throws away the one thing a structured document like a policy manual actually gives you for free: its own structure. A rule and the table underneath it belong together. A chunk should know which chapter it came from, so an answer can point back to it.
 
-## The three things that had to change, and why each one specifically breaks on Streamlit Cloud
+I built this to work through that problem properly: parsing by document structure instead of raw character count, and using hybrid retrieval (not just vector search) to fix two specific failure modes that pure semantic search runs into on this kind of document.
 
-It's tempting to assume "deploying to the cloud" just means swapping the LLM
-from local to API-based. That's necessary but not sufficient here — three
-separate pieces of the stack assumed a local machine, not one.
+A note on the source document: this project mirrors the structure of a real internal policy document I built a version of at work (chapters, sub-sections, embedded rule tables). The document here is a synthetic one I wrote myself for this portfolio version. Same retrieval challenges, zero real company data.
 
-**1. LLM — Ollama → Groq API**
-Ollama is a server process (`ollama serve`) that has to be running on the same
-machine as the app. Streamlit Community Cloud has no such server available,
-and there's no way to install and run one inside a hosted app's environment.
-Groq is a hosted API reachable over HTTPS from anywhere, so the app just needs
-an API key, not a co-located server. `config.py` resolves `GROQ_API_KEY` from
-an environment variable first, falling back to Streamlit's `st.secrets`
-mechanism — the key itself is never hardcoded or committed. Model:
-`openai/gpt-oss-20b`, a fast/cheap Groq-hosted model that's strong enough for
-grounded Q&A over a handful of retrieved chunks (`llama-3.3-70b-versatile` is
-a reasonable step up if answer quality needs to improve).
+## What it does
 
-**2. Embeddings — Ollama's nomic-embed-text → sentence-transformers, in-process**
-Same root cause as #1: `ollama.embeddings(...)` also needs the local Ollama
-server. The fix here is different from the LLM fix, though — instead of
-calling another hosted API, embeddings are generated in-process with
-`sentence-transformers` (`all-MiniLM-L6-v2`, 384 dimensions, ~80MB). The model
-weights download once from Hugging Face and then run directly on CPU inside
-the Streamlit app's own process. No server, no second API key, no added
-network dependency at query time.
+You ask a question in plain English, like "what are all the approved RelType values" or "who owns this policy." The assistant retrieves the most relevant chunks of the policy document, shows you exactly which sections it pulled from, and answers using only that retrieved context. If the answer isn't in the document, it says so instead of guessing.
 
-**3. Vector store — ChromaDB persistent client → in-memory numpy array**
-This is the swap that's easiest to miss if you assume "cloud = swap the LLM."
-Two independent problems with carrying ChromaDB's `PersistentClient` over to
-Streamlit Cloud: (a) a Streamlit Cloud app's filesystem is rebuilt on
-redeploy, so an on-disk "persistent" index isn't reliably persistent in that
-environment anyway; (b) ChromaDB depends on a newer SQLite version than what
-Streamlit Cloud's base image ships — a known, documented compatibility
-failure. Given the actual corpus size here (~25 chunks), the fix is simpler
-than working around either problem: build the whole chunk list and its
-embedding matrix once at app startup (`@st.cache_resource` in `app.py`,
-replacing the local version's one-time `python ingest.py` step), and do exact
-brute-force cosine similarity with numpy at query time (`doc_vecs @
-query_vector`, since every embedding is L2-normalized so the dot product IS
-the cosine similarity). No FAISS, no approximate-nearest-neighbor index —
-those exist to make search fast at a scale (millions of vectors) this project
-doesn't operate at. Using FAISS here would be complexity added for a problem
-that doesn't exist yet; the retrieval logic itself (`retrieval.py`) is
-otherwise identical to the local version's RRF + section-diversity approach.
+## The two retrieval problems this is designed around
 
-## What did NOT change
+Plain vector (cosine similarity) search fails in two specific, reproducible ways on a rules-heavy policy document:
 
-- `docx_parser.py` and `chunker.py` are byte-for-byte copies of the local
-  version's files. Structure-aware parsing and character-based chunking have
-  nothing to do with where the LLM or vector index live.
-- `generate_synthetic_policy.py` is also an unchanged copy — same synthetic
-  document, so the two versions are directly comparable side by side.
-- The retrieval *logic* (RRF merge, section-diversity cap, keyword extraction)
-  is unchanged, only the storage/search *mechanism* underneath it is different
-  — see `retrieval.py`'s docstring for the line-by-line diff explanation.
-- The system prompt, chunk size (700/120), and every retrieval threshold are
-  identical to the local version.
+**Semantic near-miss.** A question like "who is the owner of this policy?" embeds close to content about "Jointly-Owned-By" relationships, because "owner" and "owned" sit close together in embedding space, even though the user is asking about document stewardship, not an entity relationship type. Vector search alone returns the wrong chunk with high confidence.
+
+**Enumeration under-coverage.** A question like "what are all the RelTypes?" has nine correct answers sitting in one table. Vector search's top-k can return five of nine and rank the rest below unrelated-but-semantically-close chunks. The model then has no way of knowing its context is incomplete.
+
+Keyword search (plain substring match) fixes both. A literal "owner" search finds the metadata line regardless of embedding distance, and a literal "RelType" search surfaces every chunk that mentions it. I merge the two ranked lists with Reciprocal Rank Fusion (RRF) rather than just concatenating them, since cosine distance and a substring match aren't on a comparable scale, and rank position is the one thing both search types can be compared on fairly.
+
+On top of that, I cap how many chunks can come from the same section, so one dominant topic (like the RelType table) can't crowd out every other section the answer might also need.
+
+## Tech stack
+
+- Streamlit for the chat UI
+- Groq (`openai/gpt-oss-20b`) for the LLM, called via the Groq Python SDK
+- sentence-transformers (`all-MiniLM-L6-v2`) for embeddings, run in-process on CPU
+- numpy for cosine similarity search over the chunk embeddings
+- python-docx for parsing the source Word document
+
+No vector database. At this document's size (about 25 chunks), a plain in-memory list plus a numpy matrix is simpler and just as fast as standing up a database for it. More on that below.
 
 ## Architecture
 
 ```
 data/MasterDataGovernancePolicy.docx
-        │  (generated once via generate_synthetic_policy.py)
-        ▼
-docx_parser.py  — bold headers = section boundaries, tables → pipe-delimited text
-        ▼
-chunker.py      — 700-char chunks, 120-char overlap
-        ▼
-app.py `_build_index()` — @st.cache_resource, runs once per app lifetime:
-                  embeds every chunk (sentence-transformers, CPU, in-process),
-                  keeps {chunks, doc_vecs} in memory — no ingest.py, no on-disk DB
-        │
-        │  ◄── at query time ──►
-        ▼
-retrieval.py    — hybrid_retrieve():
-                    1. semantic search: numpy cosine similarity over doc_vecs
-                    2. keyword search: case-insensitive substring scan
-                    3. RRF merge (k=60)
-                    4. section-diversity cap (max 2 chunks/section)
-        ▼
-app.py          — Streamlit chat UI, streams the Groq LLM response
-                  (openai/gpt-oss-20b), shows which policy sections were
-                  retrieved for each answer
+        |
+        v
+docx_parser.py   bold paragraphs = section headers, tables flattened to text
+        |
+        v
+chunker.py       700-char chunks, 120-char overlap, breaks on sentence/paragraph bounds
+        |
+        v
+app.py           builds the index once at startup (cached):
+                 embeds every chunk with sentence-transformers, keeps
+                 {chunks, embeddings} in memory
+        |
+        |  <-- at query time -->
+        v
+retrieval.py     hybrid_retrieve():
+                   1. semantic search: cosine similarity via numpy
+                   2. keyword search: case-insensitive substring scan
+                   3. merge by Reciprocal Rank Fusion (k=60)
+                   4. cap chunks per section for topic diversity
+        |
+        v
+app.py           streams the Groq response, shows which sections it used
 ```
 
 ## Project layout
 
-| File | Responsibility |
+| File | What it does |
 |---|---|
-| `config.py` | Every tunable value: Groq key resolution, model names, chunk/retrieval settings |
-| `docx_parser.py` | Structure-aware document parsing — unchanged copy from the local version |
-| `chunker.py` | Overlap-aware text splitting — unchanged copy from the local version |
-| `generate_synthetic_policy.py` | Builds the sample policy `.docx` — unchanged copy |
-| `retrieval.py` | Hybrid RRF retrieval, rewritten for an in-memory numpy index instead of ChromaDB |
-| `app.py` | Streamlit chat UI — builds the index at startup, embeds/generates inline (no separate embeddings.py/llm.py), streams answers |
+| `config.py` | every tunable value in one place: API key handling, model names, chunk size, retrieval thresholds |
+| `docx_parser.py` | walks the Word document in order, splits it into chapter/section/text blocks |
+| `chunker.py` | splits each section's text into overlapping, embedding-sized chunks |
+| `generate_synthetic_policy.py` | builds the sample policy document used in this repo |
+| `retrieval.py` | hybrid search: semantic + keyword, merged with RRF, capped for section diversity |
+| `app.py` | the Streamlit app: builds the index at startup, handles chat, calls Groq |
 
-Note there's no `ingest.py` in this version — with no persistent database to
-populate ahead of time, `app.py`'s cached `_build_index()` function does that
-job at startup instead.
+## How embeddings and search work here
 
----
+An embedding is just a list of numbers that represents the meaning of a piece of text. Two chunks of text that mean similar things end up with numbers that are close together. That's what makes "search by meaning" possible instead of just exact keyword matching.
 
-## Setup: local test run (do this before deploying)
+Every chunk of the policy document gets turned into one of these number-vectors when the app starts up, using a small pretrained model (`all-MiniLM-L6-v2`) that runs directly inside the app, no external server needed. Those vectors are kept in memory for the lifetime of the app rather than saved to a database, since 25 chunks is small enough that rebuilding the index at startup takes a fraction of a second.
 
-Always test locally first — cheaper and faster to debug an API key or import
-error on your own machine than through a Streamlit Cloud redeploy cycle.
+When you ask a question, it gets turned into the same kind of vector, and I compare it against every chunk's vector with a single matrix multiplication (`numpy`), which is what "cosine similarity search" reduces to once every vector is normalized to the same length. No approximate-nearest-neighbor index (like FAISS) is involved, on purpose. Those exist to make search fast across millions of vectors. At this scale, that's solving a problem I don't have.
+
+## Setup: run it locally
 
 ```bash
+git clone <your-repo-url>
 cd PolicyAssistant_Cloud
 pip install -r requirements.txt
 
-# Get a free Groq API key at https://console.groq.com/keys
-export GROQ_API_KEY=your_key_here        # macOS/Linux
-# set GROQ_API_KEY=your_key_here         # Windows cmd
-# $env:GROQ_API_KEY="your_key_here"      # Windows PowerShell
-
-python generate_synthetic_policy.py      # builds data/MasterDataGovernancePolicy.docx
-streamlit run app.py
+python generate_synthetic_policy.py
 ```
 
-The first run will take a little longer than usual — sentence-transformers
-downloads and caches the `all-MiniLM-L6-v2` model weights the first time it's
-used. Subsequent runs are fast.
+Then set your Groq API key (get a free one at [console.groq.com/keys](https://console.groq.com/keys)) using one of these two methods:
 
-If you'd rather not use an environment variable locally, create
-`.streamlit/secrets.toml` in this folder:
+**Option A, environment variable:**
+```bash
+export GROQ_API_KEY=your_key_here        # macOS/Linux
+setx GROQ_API_KEY "your_key_here"        # Windows
+```
 
+**Option B, local secrets file:** create `.streamlit/secrets.toml` in this folder:
 ```toml
 GROQ_API_KEY = "your_key_here"
 ```
+This file is already excluded in `.gitignore`, so it never gets committed.
 
-(`.gitignore` already excludes this file so the key is never committed.)
+Then run:
+```bash
+streamlit run app.py
+```
 
-## Setup: deploying to Streamlit Community Cloud
+The first run downloads the embedding model weights (about 80MB), so it'll take a little longer than usual. After that it's fast.
 
-1. **Push this folder to GitHub.** It needs to be its own repo, or at least
-   its own subfolder in a repo — Streamlit Cloud deploys from a specific file
-   path in a specific repo/branch. Make sure `data/MasterDataGovernancePolicy.docx`
-   is committed (run `generate_synthetic_policy.py` and commit the output, or
-   have Streamlit Cloud generate it — see step 4).
+## Setup: deploy your own copy to Streamlit Community Cloud
 
-2. **Go to** [share.streamlit.io](https://share.streamlit.io) **and sign in**
-   with GitHub.
-
-3. **Click "New app"**, then select:
-   - Repository: the repo you pushed in step 1
-   - Branch: `main` (or whichever branch has this code)
-   - Main file path: `PolicyAssistant_Cloud/app.py` (adjust if this folder
-     isn't at the repo root)
-
-4. **Before or after the first deploy, add your secret.** In the app's
-   settings (⋮ menu → Settings → Secrets), add:
+1. Push this folder to a GitHub repo. Make sure `data/MasterDataGovernancePolicy.docx` is committed.
+2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
+3. Click "New app," pick the repo and branch, and set the main file path to `app.py` (or `PolicyAssistant_Cloud/app.py` if this folder isn't at the repo root).
+4. Before or after the first deploy, open the app's settings and add your key under the "Secrets" tab:
    ```toml
    GROQ_API_KEY = "your_key_here"
    ```
-   This is what `config.py`'s `_get_groq_api_key()` falls back to reading via
-   `st.secrets` when there's no environment variable set (there won't be one
-   in this hosted environment).
-
-5. **Deploy.** Streamlit Cloud installs `requirements.txt` and runs the app.
-   The first load will be slower than normal while sentence-transformers
-   downloads its model weights — that's expected and only happens once per
-   redeploy (the cache persists across user sessions, not across redeploys).
-
-6. **Get your public link** from the app's page (`https://<something>.streamlit.app`)
-   — this is what goes on LinkedIn/resume.
+5. Deploy. First load is slower while the embedding model downloads; that only happens once per redeploy.
+6. Grab the public `*.streamlit.app` link from the app page.
 
 ## Example questions to try
 
-Same as the local version — the retrieval design is the same, so the same
-questions exercise the same edge cases:
-
 - "What does EntityLevel 3 mean?"
-- "What are all the approved RelType values?" (tests enumeration coverage)
-- "Who owns this policy?" (tests the semantic-near-miss handling)
+- "What are all the approved RelType values?"
+- "Who owns this policy?"
 - "How do I handle an entity with no known city?"
 - "What's the process for deprecating an entity?"
 
-## Interview talking points, condensed
+## Design decisions
 
-- Cloud deployment isn't "swap the LLM" — three things assumed a local
-  machine (LLM, embedding model, vector store), and each broke for a
-  different, specific reason on Streamlit Cloud (no Ollama server; same
-  reason for embeddings; ChromaDB's SQLite version requirement / non-durable
-  filesystem for the vector store).
-- Why numpy instead of FAISS: at this corpus size (~25 chunks), brute-force
-  cosine similarity is already sub-millisecond. FAISS solves a scale problem
-  (millions of vectors) this project doesn't have — using it here would be
-  unjustified complexity, not correctness.
-- Why two separate project folders instead of one pluggable codebase: the
-  amount of logic actually shared between local and cloud (chunking, RRF,
-  section-diversity) is small relative to the amount that differs, so a
-  config-flag abstraction added indirection without much payoff.
-- Why `app.py` inlines the embed/generate calls instead of factoring them into
-  `embeddings.py`/`llm.py`: at this project's size, one file you can read
-  top-to-bottom beats three files you have to cross-reference.
+**Why RRF instead of just picking whichever search scored higher?** Cosine similarity and substring match aren't on a comparable numeric scale, so they can't be added together meaningfully. Rank position is the one thing both search types produce comparably.
+
+**Why numpy instead of FAISS?** FAISS solves the problem of searching millions of vectors quickly. This project has about 25. Brute-force cosine similarity over that many vectors is already sub-millisecond, so adding an approximate-nearest-neighbor library would be complexity with no real benefit.
+
+**Why one `app.py` instead of separate files for embeddings, retrieval, and generation?** I split out `retrieval.py` because that logic is substantial and genuinely reusable. But the actual embed and generate calls are just a couple of lines each, so I kept them inline in `app.py` rather than adding files that would mostly just forward a call to a library.
+
+**Why Streamlit secrets instead of a `.env` file?** Streamlit Community Cloud doesn't read `.env` files at all, since the app's filesystem comes fresh from the GitHub repo on every deploy and a `.env` file is (correctly) never committed. Streamlit's own secrets manager exists specifically to solve this: it stores the key outside of git, injects it at runtime, and works the same way locally (via `.streamlit/secrets.toml`) and in the cloud (via the app's Secrets tab). `config.py` reads an environment variable first and falls back to `st.secrets`, so both approaches work without needing a second dependency like `python-dotenv`.
 
 ## What I'd change with more time
 
-- Add a lightweight disk cache for the embedding matrix (e.g. pickle it after
-  first build) so a redeploy doesn't always re-embed from scratch — marginal
-  here at 25 chunks, but the right move if the document grows.
-- Add an eval set of question/expected-section pairs to track retrieval
-  quality numerically instead of by spot-checking answers (same item as the
-  local version's README — still true here).
-- Swap substring keyword matching for true BM25 scoring (`rank_bm25`) if the
-  document grows large enough that literal substring search starts missing
-  morphological variants.
+- Cache the embedding matrix to disk so a redeploy doesn't re-embed every chunk from scratch. Not worth it yet at 25 chunks, but the right move if the document grows.
+- Replace substring keyword matching with real BM25 scoring (`rank_bm25`) for a larger, more varied document.
+- Add an eval set of question and expected-section pairs, to measure retrieval quality instead of spot-checking answers.

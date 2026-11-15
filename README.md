@@ -1,155 +1,208 @@
-# Policy Assistant
+# Policy Assistant | Hybrid RAG for Structured Policy Documents
 
-A RAG (Retrieval-Augmented Generation) chat assistant that answers natural-language questions about a structured policy document, with every answer grounded in the actual retrieved text and citing which section it came from.
+**A document-aware retrieval-augmented generation (RAG) assistant built to answer questions about a structured policy manual using semantic and keyword retrieval, Reciprocal Rank Fusion (RRF), and a hosted LLM.**
 
-This is the cloud-hosted version, deployed on Streamlit Community Cloud with Groq for generation. There's also a fully local version of this same project that runs offline with Ollama, no API key or internet needed. See `../PolicyAssistant_Portfolio`.
+[**Try the live Streamlit demo**](https://policyassistantcloud.streamlit.app/) · [**Explore the source code**](https://github.com/bharat1271/PolicyAssistant_Cloud)
 
-**Live demo: https://policyassistantcloud.streamlit.app/
+> **Portfolio-safe demo.** This public repository uses a fictional, synthetic governance policy document. It contains no real internal policy content. The original local prototype and this cloud demo use different inference and retrieval-storage backends.
 
-## Why I built this
+## The problem
 
-Most "chat with your document" demos just dump a file into a generic text splitter and call it a day. That throws away the one thing a structured document like a policy manual actually gives you for free: its own structure. A rule and the table underneath it belong together. A chunk should know which chapter it came from, so an answer can point back to it.
+Policy manuals are harder to search than ordinary articles. They contain nested sections, rules, exceptions, metadata, and tables. A semantic-only search can retrieve text that sounds relevant but answers a different question. It can also miss some entries when a user asks for a complete list.
 
-I built this to work through that problem properly: parsing by document structure instead of raw character count, and using hybrid retrieval (not just vector search) to fix two specific failure modes that pure semantic search runs into on this kind of document.
+This project explores how **document-aware parsing and hybrid retrieval** can provide more useful context for a policy-question-answering assistant. It exposes the retrieved policy sections alongside the generated response so users can inspect its supporting material.
 
-A note on the source document: this project mirrors the structure of a real internal policy document I built a version of at work (chapters, sub-sections, embedded rule tables). The document here is a synthetic one I wrote myself for this portfolio version. Same retrieval challenges, zero real company data.
+## What the application does
 
-## What it does
+- Parses DOCX paragraphs and tables into chapter- and section-aware content.
+- Splits extracted text into overlapping chunks, retaining chapter/section metadata.
+- Embeds the chunks using `sentence-transformers/all-MiniLM-L6-v2` and caches a NumPy matrix in memory.
+- Retrieves candidates using both cosine similarity and case-insensitive keyword matching.
+- Combines candidate contributions with RRF (`k=60`) and caps how many chunks come from one section.
+- Sends the selected policy context and recent conversation history to a Groq-hosted model (`openai/gpt-oss-20b`).
+- Streams answers in Streamlit and lets users inspect retrieved chunks, clear chat, or export a conversation.
 
-You ask a question in plain English, like "what are all the approved RelType values" or "who owns this policy." The assistant retrieves the most relevant chunks of the policy document, shows you exactly which sections it pulled from, and answers using only that retrieved context. If the answer isn't in the document, it says so instead of guessing.
-
-## The two retrieval problems this is designed around
-
-Plain vector (cosine similarity) search fails in two specific, reproducible ways on a rules-heavy policy document:
-
-**Semantic near-miss.** A question like "who is the owner of this policy?" embeds close to content about "Jointly-Owned-By" relationships, because "owner" and "owned" sit close together in embedding space, even though the user is asking about document stewardship, not an entity relationship type. Vector search alone returns the wrong chunk with high confidence.
-
-**Enumeration under-coverage.** A question like "what are all the RelTypes?" has nine correct answers sitting in one table. Vector search's top-k can return five of nine and rank the rest below unrelated-but-semantically-close chunks. The model then has no way of knowing its context is incomplete.
-
-Keyword search (plain substring match) fixes both. A literal "owner" search finds the metadata line regardless of embedding distance, and a literal "RelType" search surfaces every chunk that mentions it. I merge the two ranked lists with Reciprocal Rank Fusion (RRF) rather than just concatenating them, since cosine distance and a substring match aren't on a comparable scale, and rank position is the one thing both search types can be compared on fairly.
-
-On top of that, I cap how many chunks can come from the same section, so one dominant topic (like the RelType table) can't crowd out every other section the answer might also need.
-
-## Tech stack
-
-- Streamlit for the chat UI
-- Groq (`openai/gpt-oss-20b`) for the LLM, called via the Groq Python SDK
-- sentence-transformers (`all-MiniLM-L6-v2`) for embeddings, run in-process on CPU
-- numpy for cosine similarity search over the chunk embeddings
-- python-docx for parsing the source Word document
-
-No vector database. At this document's size (about 25 chunks), a plain in-memory list plus a numpy matrix is simpler and just as fast as standing up a database for it. More on that below.
+**Scope:** This is a demonstration of retrieval-augmented policy Q&A, not a validated production compliance or policy-decision system. Source visibility is provided through a retrieved-sections panel, not claim-by-claim verified citations.
 
 ## Architecture
 
-```
-data/MasterDataGovernancePolicy.docx
-        |
-        v
-docx_parser.py   bold paragraphs = section headers, tables flattened to text
-        |
-        v
-chunker.py       700-char chunks, 120-char overlap, breaks on sentence/paragraph bounds
-        |
-        v
-app.py           builds the index once at startup (cached):
-                 embeds every chunk with sentence-transformers, keeps
-                 {chunks, embeddings} in memory
-        |
-        |  <-- at query time -->
-        v
-retrieval.py     hybrid_retrieve():
-                   1. semantic search: cosine similarity via numpy
-                   2. keyword search: case-insensitive substring scan
-                   3. merge by Reciprocal Rank Fusion (k=60)
-                   4. cap chunks per section for topic diversity
-        |
-        v
-app.py           streams the Groq response, shows which sections it used
+```mermaid
+flowchart TD
+    subgraph Indexing[Document indexing: cached during app runtime]
+        A["Synthetic policy DOCX"] --> B["DOCX parser: paragraphs, tables, chapters and sections"]
+        B --> C["Custom chunker: 700 characters, 120 overlap"]
+        C --> D["SentenceTransformer: all-MiniLM-L6-v2"]
+        D --> E["In-memory chunk list + normalized NumPy embedding matrix"]
+    end
+
+    subgraph Runtime[Question answering]
+        Q["User question in Streamlit"] --> QE["Embed the question"]
+        QE --> S["Cosine similarity over NumPy matrix"]
+        Q --> K["Extract keywords and match text substrings"]
+        E --> S
+        E --> K
+        S --> R["Combine results with RRF k=60"]
+        K --> R
+        R --> V["Limit chunks per section; select up to 8"]
+        V --> P["System instructions + retrieved context + recent chat"]
+        P --> G["Groq-hosted openai/gpt-oss-20b"]
+        G --> O["Stream answer + show retrieved sections"]
+    end
 ```
 
-## Project layout
+**Two phases:** Documents are parsed, chunked, embedded and cached when the application builds its index. At question time, the question is embedded, both retrieval methods contribute candidates, selected chunks form the context, and the LLM generates an answer. The index is rebuilt when the application cache is rebuilt; it is not stored in a persistent vector database in this cloud version.
 
-| File | What it does |
-|---|---|
-| `config.py` | every tunable value in one place: API key handling, model names, chunk size, retrieval thresholds |
-| `docx_parser.py` | walks the Word document in order, splits it into chapter/section/text blocks |
-| `chunker.py` | splits each section's text into overlapping, embedding-sized chunks |
-| `generate_synthetic_policy.py` | builds the sample policy document used in this repo |
-| `retrieval.py` | hybrid search: semantic + keyword, merged with RRF, capped for section diversity |
-| `app.py` | the Streamlit app: builds the index at startup, handles chat, calls Groq |
+## Why hybrid retrieval?
 
-## How embeddings and search work here
+Two examples from the synthetic policy illustrate the intended retrieval challenges:
 
-An embedding is just a list of numbers that represents the meaning of a piece of text. Two chunks of text that mean similar things end up with numbers that are close together. That's what makes "search by meaning" possible instead of just exact keyword matching.
+| Query | Potential semantic-only limitation | Why keyword matching can help |
+|---|---|---|
+| “Who owns this policy?” | A chunk mentioning `Jointly-Owned-By` may be semantically similar to “owner” without identifying the document steward. | An exact owner-related term can introduce relevant metadata or document passages as candidates. |
+| “What are all approved RelType values?” | A top-k similarity search may not include every relevant table passage. | Matching `RelType` can add passages containing the term, improving candidate coverage. |
 
-Every chunk of the policy document gets turned into one of these number-vectors when the app starts up, using a small pretrained model (`all-MiniLM-L6-v2`) that runs directly inside the app, no external server needed. Those vectors are kept in memory for the lifetime of the app rather than saved to a database, since 25 chunks is small enough that rebuilding the index at startup takes a fraction of a second.
+These are design motivations, **not measured claims of higher accuracy**. Keyword matching does not guarantee completeness or resolve every ambiguous question. A formal retrieval evaluation is a planned improvement.
 
-When you ask a question, it gets turned into the same kind of vector, and I compare it against every chunk's vector with a single matrix multiplication (`numpy`), which is what "cosine similarity search" reduces to once every vector is normalized to the same length. No approximate-nearest-neighbor index (like FAISS) is involved, on purpose. Those exist to make search fast across millions of vectors. At this scale, that's solving a problem I don't have.
+### Retrieval details
 
-## Setup: run it locally
+In [`retrieval.py`](retrieval.py):
+
+1. **Semantic candidates:** normalize document and query embeddings and calculate cosine similarity with a matrix-vector dot product. Convert similarity to cosine distance (`distance = 1 - similarity`); only candidates with distance below `0.80` enter from the semantic path, up to the requested result count.
+2. **Keyword candidates:** remove common stopwords from the question, retain up to four meaningful terms, then scan chunks with case-insensitive substring matching.
+3. **RRF-style merge:** accumulate `1 / (60 + rank)` contributions for ranked semantic candidates. In the current simplified keyword path, each matching chunk receives a rank-1 contribution **for each matching keyword**. This is not BM25 and does not rank keyword matches by relevance; multiple keyword matches can increase the same chunk's score.
+4. **Diversity:** return at most two chunks per section and up to eight chunks total.
+
+This is a lightweight retrieval design intentionally suited to the small synthetic corpus. It is not a general benchmark against ChromaDB, FAISS, BM25, or other retrieval systems.
+
+## Technology decisions
+
+| Component | Public cloud demo | Why |
+|---|---|---|
+| UI | Streamlit | Interactive chat, streaming responses, and source inspection |
+| Document parser | `python-docx` + custom logic | Preserve document structure and table text |
+| Chunker | Custom Python | Control boundaries and overlap within extracted sections |
+| Embeddings | `all-MiniLM-L6-v2` via SentenceTransformers | Local CPU embedding inside the cloud app process |
+| Vector retrieval | NumPy | Exact cosine comparison is simple for a small corpus |
+| Keyword retrieval | Case-insensitive substring scan | Lightweight exact-term candidate discovery |
+| Fusion | RRF-style scoring | Combine candidate signals without adding cosine and substring scores directly |
+| LLM | Groq API, `openai/gpt-oss-20b` | Hosted generation without running an Ollama server in Streamlit Cloud |
+
+### Local prototype versus public cloud version
+
+| | Original local implementation | This public cloud implementation |
+|---|---|---|
+| Inference | Qwen 2.5 14B through Ollama | `openai/gpt-oss-20b` through Groq |
+| Embeddings | Ollama `nomic-embed-text` | SentenceTransformers `all-MiniLM-L6-v2` |
+| Retrieval storage | Persistent ChromaDB | Cached Python chunks + NumPy matrix |
+| Hosting | Local machine | Streamlit Community Cloud |
+| Document | Restricted original policy (not published) | Fictional synthetic policy |
+
+Both versions share the overall approach of structured document parsing, overlapping chunks, semantic and keyword retrieval, fusion, context construction, and grounded answer generation. **This repository contains the cloud version's source code; it is not the local Ollama codebase.**
+
+## Project structure
+
+```text
+PolicyAssistant_Cloud/
+├── app.py                        # Streamlit UI, cached indexing and Groq generation
+├── config.py                     # Paths, model settings, retrieval parameters and prompt
+├── docx_parser.py               # Structured paragraphs/tables and section extraction
+├── chunker.py                   # Custom overlapping chunk generation
+├── retrieval.py                 # Semantic retrieval, keyword matching and fusion
+├── generate_synthetic_policy.py # Creates the fictional example DOCX
+├── data/
+│   └── MasterDataGovernancePolicy.docx
+├── requirements.txt
+└── README.md
+```
+
+## Run locally
+
+**Requirements:** Python 3.10 or newer, internet access on the first embedding-model download, and a Groq API key. This command runs the **cloud-style application on your computer**, not the Ollama version.
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/bharat1271/PolicyAssistant_Cloud.git
 cd PolicyAssistant_Cloud
-pip install -r requirements.txt
+python -m venv .venv
+```
 
+Activate the virtual environment:
+
+```bash
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+
+# macOS/Linux
+source .venv/bin/activate
+```
+
+Then install dependencies and start the app:
+
+```bash
+pip install -r requirements.txt
+# Optional: regenerate the fictional example policy document
 python generate_synthetic_policy.py
 ```
 
-Then set your Groq API key (get a free one at [console.groq.com/keys](https://console.groq.com/keys)) using one of these two methods:
+Set your key using an environment variable or an untracked `.streamlit/secrets.toml`:
 
-**Option A, environment variable:**
-```bash
-export GROQ_API_KEY=your_key_here        # macOS/Linux
-setx GROQ_API_KEY "your_key_here"        # Windows
-```
-
-**Option B, local secrets file:** create `.streamlit/secrets.toml` in this folder:
 ```toml
-GROQ_API_KEY = "your_key_here"
+# .streamlit/secrets.toml
+GROQ_API_KEY = "your_groq_api_key"
 ```
-This file is already excluded in `.gitignore`, so it never gets committed.
 
-Then run:
+Alternatively, set `GROQ_API_KEY` in your shell before starting the application. Finally:
+
 ```bash
 streamlit run app.py
 ```
 
-The first run downloads the embedding model weights (about 80MB), so it'll take a little longer than usual. After that it's fast.
+> **Security:** Never commit API keys or local secrets to Git. Before running this setup, add a `.gitignore` entry for `.streamlit/secrets.toml`, `.env`, `.venv/`, and `__pycache__/`. The existing README references a `.gitignore`, but it was not present in the inspected repository root.
 
-## Setup: deploy your own copy to Streamlit Community Cloud
+## Deploy on Streamlit Community Cloud
 
-1. Push this folder to a GitHub repo. Make sure `data/MasterDataGovernancePolicy.docx` is committed.
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-3. Click "New app," pick the repo and branch, and set the main file path to `app.py` (or `PolicyAssistant_Cloud/app.py` if this folder isn't at the repo root).
-4. Before or after the first deploy, open the app's settings and add your key under the "Secrets" tab:
-   ```toml
-   GROQ_API_KEY = "your_key_here"
-   ```
-5. Deploy. First load is slower while the embedding model downloads; that only happens once per redeploy.
-6. Grab the public `*.streamlit.app` link from the app page.
+1. Fork or clone the repository with the synthetic DOCX file included.
+2. Create an app in [Streamlit Community Cloud](https://share.streamlit.io/) with `app.py` as its entry point.
+3. Configure `GROQ_API_KEY` through the Streamlit application's **Secrets** settings.
+4. Deploy and verify the app loads the sample document and can answer one of the example questions.
 
-## Example questions to try
+Do not publish your API key in the repository or place internal policy files in a public deployment.
 
-- "What does EntityLevel 3 mean?"
-- "What are all the approved RelType values?"
-- "Who owns this policy?"
-- "How do I handle an entity with no known city?"
-- "What's the process for deprecating an entity?"
+## Sample questions
 
-## Design decisions
+- What does EntityLevel 3 mean?
+- What are all the approved RelType values?
+- Who owns this policy?
+- How should an entity with no verified city be handled?
+- What is the process for deprecating an entity?
+- What does the document say about a topic not covered in the policy?
 
-**Why RRF instead of just picking whichever search scored higher?** Cosine similarity and substring match aren't on a comparable numeric scale, so they can't be added together meaningfully. Rank position is the one thing both search types produce comparably.
+For each response, expand **Policy sections retrieved** to examine the actual context that was passed to the model.
 
-**Why numpy instead of FAISS?** FAISS solves the problem of searching millions of vectors quickly. This project has about 25. Brute-force cosine similarity over that many vectors is already sub-millisecond, so adding an approximate-nearest-neighbor library would be complexity with no real benefit.
+## Limitations and next steps
 
-**Why one `app.py` instead of separate files for embeddings, retrieval, and generation?** I split out `retrieval.py` because that logic is substantial and genuinely reusable. But the actual embed and generate calls are just a couple of lines each, so I kept them inline in `app.py` rather than adding files that would mostly just forward a call to a library.
+**Current limitations:**
 
-**Why Streamlit secrets instead of a `.env` file?** Streamlit Community Cloud doesn't read `.env` files at all, since the app's filesystem comes fresh from the GitHub repo on every deploy and a `.env` file is (correctly) never committed. Streamlit's own secrets manager exists specifically to solve this: it stores the key outside of git, injects it at runtime, and works the same way locally (via `.streamlit/secrets.toml`) and in the cloud (via the app's Secrets tab). `config.py` reads an environment variable first and falls back to `st.secrets`, so both approaches work without needing a second dependency like `python-dotenv`.
+- Substring search is not BM25 and has no keyword relevance ranking.
+- Multiple matching keywords can contribute repeatedly to a chunk's fused score.
+- A two-chunks-per-section cap may omit information when a complete list spans several chunks in one section.
+- Follow-up questions are retrieved using the current message, without rewriting it into a standalone, context-rich question.
+- Prompt instructions encourage grounding, but do not formally guarantee factual correctness or abstention.
+- Retrieved sections are visible, but claims in the generated answer are not individually linked to evidence spans.
+- No published, repeatable retrieval/answer-quality benchmark is included yet.
 
-## What I'd change with more time
+**Potential improvements:**
 
-- Cache the embedding matrix to disk so a redeploy doesn't re-embed every chunk from scratch. Not worth it yet at 25 chunks, but the right move if the document grows.
-- Replace substring keyword matching with real BM25 scoring (`rank_bm25`) for a larger, more varied document.
-- Add an eval set of question and expected-section pairs, to measure retrieval quality instead of spot-checking answers.
+- Add a small evaluation set with expected sections, answer completeness, exception handling, and no-answer cases.
+- Introduce optional standalone-question rewriting for follow-ups.
+- Compare substring matching against BM25 and refine keyword fusion.
+- Add claim-level source linking and more reliable unsupported-answer detection.
+- Cache/version document embeddings when corpus size grows.
+- Add error handling and configuration checks for hosted model failures.
+
+## Data and confidentiality
+
+The public DOCX and synthetic generator are fictional demonstration assets. They are designed to illustrate the structural problems of policy search without including actual internal policy text. The original policy document, internal index, and organization-specific data are **not part of this public repository**.
+
+---
+
+**Maintainer:** [Bharat Kumar](https://github.com/bharat1271) · **[Live demo](https://policyassistantcloud.streamlit.app/)**
